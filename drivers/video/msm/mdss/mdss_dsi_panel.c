@@ -114,8 +114,8 @@ static struct dsi_cmd_desc dcs_read_cmd = {
 	dcs_cmd
 };
 
-u32 mdss_dsi_dcs_read(struct mdss_dsi_ctrl_pdata *ctrl,
-			char cmd0, char cmd1)
+u32 mdss_dsi_panel_cmd_read(struct mdss_dsi_ctrl_pdata *ctrl, char cmd0,
+		char cmd1, void (*fxn)(int), char *rbuf, int len)
 {
 	struct dcs_cmd_req cmdreq;
 
@@ -125,8 +125,9 @@ u32 mdss_dsi_dcs_read(struct mdss_dsi_ctrl_pdata *ctrl,
 	cmdreq.cmds = &dcs_read_cmd;
 	cmdreq.cmds_cnt = 1;
 	cmdreq.flags = CMD_REQ_RX | CMD_REQ_COMMIT;
-	cmdreq.rlen = 1;
-	cmdreq.cb = NULL; /* call back */
+	cmdreq.rlen = len;
+	cmdreq.rbuf = rbuf;
+	cmdreq.cb = fxn; /* call back */
 	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
 	/*
 	 * blocked here, until call back called
@@ -301,6 +302,17 @@ static int mdss_dsi_panel_partial_update(struct mdss_panel_data *pdata)
 	return rc;
 }
 
+static struct mdss_dsi_ctrl_pdata *get_rctrl_data(struct mdss_panel_data *pdata)
+{
+	if (!pdata || !pdata->next) {
+		pr_err("%s: Invalid panel data\n", __func__);
+		return NULL;
+	}
+
+	return container_of(pdata->next, struct mdss_dsi_ctrl_pdata,
+			panel_data);
+}
+
 static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 							u32 bl_level)
 {
@@ -327,6 +339,16 @@ static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 		break;
 	case BL_DCS_CMD:
 		mdss_dsi_panel_bklt_dcs(ctrl_pdata, bl_level);
+		if (ctrl_pdata->shared_pdata.broadcast_enable &&
+				ctrl_pdata->ndx == DSI_CTRL_0) {
+			struct mdss_dsi_ctrl_pdata *rctrl_pdata = NULL;
+			rctrl_pdata = get_rctrl_data(pdata);
+			if (!rctrl_pdata) {
+				pr_err("%s: Right ctrl data NULL\n", __func__);
+				return;
+			}
+			mdss_dsi_panel_bklt_dcs(rctrl_pdata, bl_level);
+		}
 		break;
 	default:
 		pr_err("%s: Unknown bl_ctrl configuration\n",
@@ -649,6 +671,7 @@ static int mdss_panel_parse_dt(struct platform_device *pdev,
 	pinfo->mipi.dst_format = (!rc ? tmp : DSI_VIDEO_DST_FORMAT_RGB888);
 
 	rc = of_property_read_u32(np, "qcom,mdss-pan-dsi-vc", &tmp);
+
 	pinfo->mipi.vc = (!rc ? tmp : 0);
 
 	rc = of_property_read_u32(np, "qcom,mdss-pan-dsi-rgb-swap", &tmp);
@@ -775,6 +798,8 @@ static int mdss_panel_parse_dt(struct platform_device *pdev,
 		pinfo->fbc.target_bpp =
 			pinfo->bpp;
 	}
+	pinfo->mipi.last_line_interleave_en = of_property_read_bool(np,
+		"qcom,mdss-dsi-last-line-interleave");
 
 	mdss_dsi_parse_dcs_cmds(np, &panel_data->on_cmds,
 		"qcom,panel-on-cmds", "qcom,on-cmds-dsi-state");
@@ -1208,6 +1233,9 @@ static void send_local_on_cmds(struct work_struct *work)
 
 	ctrl = container_of(cmds_panel_data, struct mdss_dsi_ctrl_pdata,
 			    panel_data);
+
+	if (cmds_panel_data->panel_info.cont_splash_enabled)
+		return;
 
 	if (local_pdata->on_cmds.cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, &local_pdata->on_cmds);

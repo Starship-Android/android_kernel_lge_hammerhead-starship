@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -39,7 +39,7 @@
 static DEFINE_MUTEX(mdss_mdp_sspp_lock);
 static DEFINE_MUTEX(mdss_mdp_smp_lock);
 
-static int mdss_mdp_pipe_free(struct mdss_mdp_pipe *pipe);
+static void mdss_mdp_pipe_free(struct kref *kref);
 static int mdss_mdp_smp_mmb_set(int client_id, unsigned long *smp);
 static void mdss_mdp_smp_mmb_free(unsigned long *smp, bool write);
 static struct mdss_mdp_pipe *mdss_mdp_pipe_search_by_client_id(
@@ -137,12 +137,21 @@ static void mdss_mdp_smp_mmb_free(unsigned long *smp, bool write)
 	}
 }
 
+/**
+ * @mdss_mdp_smp_get_size - get allocated smp size for a pipe
+ * @pipe: pointer to a pipe
+ *
+ * Function counts number of blocks that are currently allocated for a
+ * pipe, then smp buffer size is number of blocks multiplied by block
+ * size.
+ */
 u32 mdss_mdp_smp_get_size(struct mdss_mdp_pipe *pipe)
 {
 	int i, mb_cnt = 0;
 
 	for (i = 0; i < MAX_PLANES; i++) {
 		mb_cnt += bitmap_weight(pipe->smp_map[i].allocated, SMP_MB_CNT);
+		mb_cnt += bitmap_weight(pipe->smp_map[i].fixed, SMP_MB_CNT);
 	}
 
 	return mb_cnt * SMP_MB_SIZE;
@@ -209,7 +218,7 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 	struct mdss_mdp_plane_sizes ps;
 	int i;
 	int rc = 0, rot_mode = 0, wb_mixer = 0;
-	u32 nlines, format;
+	u32 nlines, format, seg_w;
 	u16 width;
 
 	width = pipe->src.w >> pipe->horz_deci;
@@ -221,19 +230,17 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 			return rc;
 		/*
 		 * Override fetch strides with SMP buffer size for both the
-		 * planes
+		 * planes. BWC line buffer needs to be divided into 16
+		 * segments and every segment is aligned to format
+		 * specific RAU size
 		 */
+		seg_w = DIV_ROUND_UP(pipe->src.w, 16);
 		if (pipe->src_fmt->fetch_planes == MDSS_MDP_PLANE_INTERLEAVED) {
-			/*
-			 * BWC line buffer needs to be divided into 16
-			 * segments and every segment is aligned to format
-			 * specific RAU size
-			 */
-			ps.ystride[0] = ALIGN(pipe->src.w / 16 , 32) * 16 *
-				ps.rau_h[0] * pipe->src_fmt->bpp;
+			ps.ystride[0] = ALIGN(seg_w, 32) * 16 * ps.rau_h[0] *
+					pipe->src_fmt->bpp;
 			ps.ystride[1] = 0;
 		} else {
-			u32 bwc_width = ALIGN(pipe->src.w / 16, 64) * 16;
+			u32 bwc_width = ALIGN(seg_w, 64) * 16;
 			ps.ystride[0] = bwc_width * ps.rau_h[0];
 			ps.ystride[1] = bwc_width * ps.rau_h[1];
 			/*
@@ -265,7 +272,7 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 			}
 		}
 		rc = mdss_mdp_get_plane_sizes(format, width, pipe->src.h,
-			&ps, 0);
+			&ps, 0, 0);
 		if (rc)
 			return rc;
 
@@ -476,21 +483,17 @@ int mdss_mdp_smp_handoff(struct mdss_data_type *mdata)
 
 void mdss_mdp_pipe_unmap(struct mdss_mdp_pipe *pipe)
 {
-	int tmp;
-
-	tmp = atomic_dec_return(&pipe->ref_cnt);
-
-	WARN(tmp < 0, "Invalid unmap with ref_cnt=%d", tmp);
-	if (tmp == 0)
-		mdss_mdp_pipe_free(pipe);
+	if (kref_put_mutex(&pipe->kref, mdss_mdp_pipe_free,
+			&mdss_mdp_sspp_lock)) {
+		WARN(1, "Unexpected free pipe during unmap");
+		mutex_unlock(&mdss_mdp_sspp_lock);
+	}
 }
 
 int mdss_mdp_pipe_map(struct mdss_mdp_pipe *pipe)
 {
-	if (!atomic_inc_not_zero(&pipe->ref_cnt)) {
-		pr_err("attempting to map unallocated pipe (%d)", pipe->num);
+	if (!kref_get_unless_zero(&pipe->kref))
 		return -EINVAL;
-	}
 	return 0;
 }
 
@@ -536,7 +539,7 @@ static struct mdss_mdp_pipe *mdss_mdp_pipe_init(struct mdss_mdp_mixer *mixer,
 
 	for (i = off; i < npipes; i++) {
 		pipe = pipe_pool + i;
-		if (atomic_cmpxchg(&pipe->ref_cnt, 0, 1) == 0) {
+		if (atomic_read(&pipe->kref.refcount) == 0) {
 			pipe->mixer = mixer;
 			break;
 		}
@@ -546,7 +549,6 @@ static struct mdss_mdp_pipe *mdss_mdp_pipe_init(struct mdss_mdp_mixer *mixer,
 	if (pipe && mdss_mdp_pipe_fetch_halt(pipe)) {
 		pr_err("%d failed because pipe is in bad state\n",
 			pipe->num);
-		atomic_dec(&pipe->ref_cnt);
 		return NULL;
 	}
 
@@ -554,13 +556,14 @@ static struct mdss_mdp_pipe *mdss_mdp_pipe_init(struct mdss_mdp_mixer *mixer,
 		pr_debug("type=%x   pnum=%d\n", pipe->type, pipe->num);
 		mutex_init(&pipe->pp_res.hist.hist_mutex);
 		spin_lock_init(&pipe->pp_res.hist.hist_lock);
+		kref_init(&pipe->kref);
 	} else if (pipe_share) {
 		/*
 		 * when there is no dedicated wfd blk, DMA pipe can be
 		 * shared as long as its attached to a writeback mixer
 		 */
 		pipe = mdata->dma_pipes + mixer->num;
-		atomic_inc(&pipe->ref_cnt);
+		kref_get(&pipe->kref);
 		pr_debug("pipe sharing for pipe=%d\n", pipe->num);
 	} else {
 		pr_err("no %d type pipes available\n", type);
@@ -582,7 +585,7 @@ struct mdss_mdp_pipe *mdss_mdp_pipe_alloc_dma(struct mdss_mdp_mixer *mixer)
 	} else if (pipe != &mdata->dma_pipes[mixer->num]) {
 		pr_err("Requested DMA pnum=%d not available\n",
 			mdata->dma_pipes[mixer->num].num);
-		mdss_mdp_pipe_unmap(pipe);
+		kref_put(&pipe->kref, mdss_mdp_pipe_free);
 		pipe = NULL;
 	} else {
 		pipe->mixer = mixer;
@@ -669,10 +672,13 @@ struct mdss_mdp_pipe *mdss_mdp_pipe_search(struct mdss_data_type *mdata,
 	return NULL;
 }
 
-static int mdss_mdp_pipe_free(struct mdss_mdp_pipe *pipe)
+static void mdss_mdp_pipe_free(struct kref *kref)
 {
-	pr_debug("ndx=%x pnum=%d ref_cnt=%d\n", pipe->ndx, pipe->num,
-			atomic_read(&pipe->ref_cnt));
+	struct mdss_mdp_pipe *pipe;
+
+	pipe = container_of(kref, struct mdss_mdp_pipe, kref);
+
+	pr_debug("ndx=%x pnum=%d\n", pipe->ndx, pipe->num);
 
 	if (pipe->play_cnt) {
 		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
@@ -687,8 +693,6 @@ static int mdss_mdp_pipe_free(struct mdss_mdp_pipe *pipe)
 	pipe->flags = 0;
 	pipe->bwc_mode = 0;
 	pipe->mfd = NULL;
-
-	return 0;
 }
 
 static int mdss_mdp_is_pipe_idle(struct mdss_mdp_pipe *pipe,
@@ -796,19 +800,16 @@ int mdss_mdp_pipe_fetch_halt(struct mdss_mdp_pipe *pipe)
 
 int mdss_mdp_pipe_destroy(struct mdss_mdp_pipe *pipe)
 {
-	int tmp;
-
-	tmp = atomic_dec_return(&pipe->ref_cnt);
-
-	if (tmp != 0) {
-		pr_err("unable to free pipe %d while still in use (%d)\n",
-				pipe->num, tmp);
+	if (!kref_put_mutex(&pipe->kref, mdss_mdp_pipe_free,
+			&mdss_mdp_sspp_lock)) {
+		pr_err("unable to free pipe %d while still in use\n",
+				pipe->num);
 		return -EBUSY;
 	}
-	mdss_mdp_pipe_free(pipe);
+
+	mutex_unlock(&mdss_mdp_sspp_lock);
 
 	return 0;
-
 }
 
 /**
@@ -867,38 +868,21 @@ int mdss_mdp_pipe_handoff(struct mdss_mdp_pipe *pipe)
 
 	pipe->is_handed_off = true;
 	pipe->play_cnt = 1;
-	atomic_inc(&pipe->ref_cnt);
+	kref_init(&pipe->kref);
 
 error:
 	return rc;
 }
 
-void mdss_mdp_crop_rect(struct mdss_mdp_img_rect *src_rect,
-	struct mdss_mdp_img_rect *dst_rect,
-	const struct mdss_mdp_img_rect *sci_rect)
-{
-	struct mdss_mdp_img_rect res;
-	mdss_mdp_intersect_rect(&res, dst_rect, sci_rect);
-
-	if (res.w && res.h) {
-		if ((res.w != dst_rect->w) || (res.h != dst_rect->h)) {
-			src_rect->x = src_rect->x + (res.x - dst_rect->x);
-			src_rect->y = src_rect->y + (res.y - dst_rect->y);
-			src_rect->w = res.w;
-			src_rect->h = res.h;
-		}
-		*dst_rect = (struct mdss_mdp_img_rect)
-			{(res.x - sci_rect->x), (res.y - sci_rect->y),
-			res.w, res.h};
-	}
-}
-
-static int mdss_mdp_image_setup(struct mdss_mdp_pipe *pipe)
+static int mdss_mdp_image_setup(struct mdss_mdp_pipe *pipe,
+					struct mdss_mdp_data *data)
 {
 	u32 img_size, src_size, src_xy, dst_size, dst_xy, ystride0, ystride1;
 	u32 width, height;
 	u32 decimation;
 	struct mdss_mdp_img_rect sci, dst, src;
+	bool rotation = false;
+	int ret = 0;
 
 	pr_debug("pnum=%d wh=%dx%d src={%d,%d,%d,%d} dst={%d,%d,%d,%d}\n",
 			pipe->num, pipe->img_width, pipe->img_height,
@@ -907,8 +891,18 @@ static int mdss_mdp_image_setup(struct mdss_mdp_pipe *pipe)
 
 	width = pipe->img_width;
 	height = pipe->img_height;
+
+	if (pipe->flags & MDP_SOURCE_ROTATED_90)
+		rotation = true;
+
 	mdss_mdp_get_plane_sizes(pipe->src_fmt->format, width, height,
-			&pipe->src_planes, pipe->bwc_mode);
+			&pipe->src_planes, pipe->bwc_mode, rotation);
+
+	if (data != NULL) {
+		ret = mdss_mdp_data_check(data, &pipe->src_planes);
+		if (ret)
+			return ret;
+	}
 
 	if ((pipe->flags & MDP_DEINTERLACE) &&
 			!(pipe->flags & MDP_SOURCE_ROTATED_90)) {
@@ -1119,11 +1113,11 @@ static int mdss_mdp_src_addr_setup(struct mdss_mdp_pipe *pipe,
 static int mdss_mdp_pipe_solidfill_setup(struct mdss_mdp_pipe *pipe)
 {
 	int ret;
-	u32 secure, format;
+	u32 secure, format, unpack;
 
 	pr_debug("solid fill setup on pnum=%d\n", pipe->num);
 
-	ret = mdss_mdp_image_setup(pipe);
+	ret = mdss_mdp_image_setup(pipe, NULL);
 	if (ret) {
 		pr_err("image setup error for pnum=%d\n", pipe->num);
 		return ret;
@@ -1132,10 +1126,21 @@ static int mdss_mdp_pipe_solidfill_setup(struct mdss_mdp_pipe *pipe)
 	format = MDSS_MDP_FMT_SOLID_FILL;
 	secure = (pipe->flags & MDP_SECURE_OVERLAY_SESSION ? 0xF : 0x0);
 
+	/* support ARGB color format only */
+	unpack = (C3_ALPHA << 24) | (C2_R_Cr << 16) |
+		(C1_B_Cb << 8) | (C0_G_Y << 0);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_FORMAT, format);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_CONSTANT_COLOR,
 		pipe->bg_color);
+	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_UNPACK_PATTERN, unpack);
 	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_ADDR_SW_STATUS, secure);
+	mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SSPP_SRC_OP_MODE, 0);
+
+	if (pipe->type != MDSS_MDP_PIPE_TYPE_DMA) {
+		mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_SCALE_CONFIG, 0);
+		if (pipe->type == MDSS_MDP_PIPE_TYPE_VIG)
+			mdss_mdp_pipe_write(pipe, MDSS_MDP_REG_VIG_OP_MODE, 0);
+	}
 
 	return 0;
 }
@@ -1186,7 +1191,7 @@ int mdss_mdp_pipe_queue_data(struct mdss_mdp_pipe *pipe,
 			goto done;
 		}
 
-		ret = mdss_mdp_image_setup(pipe);
+		ret = mdss_mdp_image_setup(pipe, src_data);
 		if (ret) {
 			pr_err("image setup error for pnum=%d\n", pipe->num);
 			goto done;

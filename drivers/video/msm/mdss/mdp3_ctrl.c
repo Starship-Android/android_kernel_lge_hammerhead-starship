@@ -28,10 +28,7 @@
 #define MDP_CORE_CLK_RATE	100000000
 #define MDP_VSYNC_CLK_RATE	19200000
 
-static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd,
-					struct mdp_overlay *req,
-					int image_size,
-					int *pipe_ndx);
+static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd);
 static int mdp3_overlay_unset(struct msm_fb_data_type *mfd, int ndx);
 static int mdp3_histogram_stop(struct mdp3_session_data *session,
 					u32 block);
@@ -217,8 +214,8 @@ static int mdp3_ctrl_res_req_bus(struct msm_fb_data_type *mfd, int status)
 	int rc = 0;
 	if (status) {
 		struct mdss_panel_info *panel_info = mfd->panel_info;
-		int ab = 0;
-		int ib = 0;
+		u64 ab = 0;
+		u64 ib = 0;
 		ab = panel_info->xres * panel_info->yres * 4;
 		ab *= panel_info->mipi.frame_rate;
 		ib = (ab * 3) / 2;
@@ -692,10 +689,7 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 	return rc;
 }
 
-static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd,
-					struct mdp_overlay *req,
-					int image_size,
-					int *pipe_ndx)
+static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
 {
 	struct fb_info *fbi;
 	struct mdp3_session_data *mdp3_session;
